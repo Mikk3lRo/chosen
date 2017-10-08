@@ -36,6 +36,8 @@ class AbstractChosen
     @max_shown_results = @options.max_shown_results || Number.POSITIVE_INFINITY
     @case_sensitive_search = @options.case_sensitive_search || false
     @hide_results_on_select = if @options.hide_results_on_select? then @options.hide_results_on_select else true
+    @search_term_delimiter = @options.search_term_delimiter || false
+    @search_in_order = if @options.search_in_order? then @options.search_in_order else false
 
   set_default_text: ->
     if @form_field.getAttribute("data-placeholder")
@@ -165,14 +167,34 @@ class AbstractChosen
     results = 0
 
     query = this.get_search_text()
-    escapedQuery = query.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&")
-    regex = this.get_search_regex(escapedQuery)
+    
+    #Split query in terms
+    search_term_delimiter = if @search_term_delimiter == true then /\s/ else @search_term_delimiter
+    if search_term_delimiter
+      terms = query.split(search_term_delimiter).filter(Boolean)
+    else
+      terms = [query].filter(Boolean)
+      
+    unless @case_sensitive_search then terms = terms.map (v) -> v.toLowerCase()
+    regex_flag = if @case_sensitive_search then "" else "i"
+
+    unless @search_in_order then terms.sort (a, b) -> b.length - a.length
+
+    terms_esc = terms.map (v) -> v.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&")
+    
+    terms_esc = terms_esc.map (v) => (if @search_contains then '()' else '(^|\\b|\\s)') + '(' + v + ')'
+      
+    if @search_in_order # In order
+      regex_string = terms_esc.join('(.*?)')
+      unless @enable_split_word_search or @search_contains then regex_string = "^" + regex_string
+      regex = new RegExp(regex_string, regex_flag)
+    else # Any order
+      terms_regexes = terms_esc.map (v) -> new RegExp(v, 'g' + regex_flag)
 
     for option in @results_data
 
       option.search_match = false
       results_group = null
-      search_match = null
       option.highlighted_html = ''
 
       if this.include_option_in_results(option)
@@ -189,19 +211,23 @@ class AbstractChosen
         text = if option.group then option.label else option.text
 
         unless option.group and not @group_search
-          search_match = this.search_string_match(text, regex)
-          option.search_match = search_match?
-
-          results += 1 if option.search_match and not option.group
-
+          if (!terms.length)
+            option.highlighted_html = this.escape_html text
+            option.search_match = true
+          else
+            if @search_in_order
+              option.highlighted_html = this.highlight_replace_in_order text, regex, terms
+            else
+              option.highlighted_html = this.highlight_replace_any_order text, terms_regexes, terms
+            if @search_highlight_full_match
+              option.highlighted_html = option.highlighted_html.replace(/<em>.*<\/em>/, (m) -> '<em>' + m.replace(/<\/?em>/g, '') + '</em>')
+            else
+              option.highlighted_html = option.highlighted_html.replace(/<\/em>(\s*)<em>/g, '$1')
+            option.search_match = option.highlighted_html != text
+          
+          unless option.search_match then option.highlighted_html = this.escape_html option.highlighted_html
           if option.search_match
-            if query.length
-              startpos = search_match.index
-              prefix = text.slice(0, startpos)
-              fix    = text.slice(startpos, startpos + query.length)
-              suffix = text.slice(startpos + query.length)
-              option.highlighted_html = "#{this.escape_html(prefix)}<em>#{this.escape_html(fix)}</em>#{this.escape_html(suffix)}"
-
+            results += 1 if not option.group
             results_group.group_match = true if results_group?
 
           else if option.group_array_index? and @results_data[option.group_array_index].search_match
@@ -216,16 +242,63 @@ class AbstractChosen
       this.update_results_content this.results_option_build()
       this.winnow_results_set_highlight()
 
-  get_search_regex: (escaped_search_string) ->
-    regex_string = if @search_contains then escaped_search_string else "(^|\\s|\\b)#{escaped_search_string}[^\\s]*"
-    regex_string = "^#{regex_string}" unless @enable_split_word_search or @search_contains
-    regex_flag = if @case_sensitive_search then "" else "i"
-    new RegExp(regex_string, regex_flag)
+  highlight_replace_any_order: (text, terms_regexes) ->
+    replace_inner = (bites, depth = 1) =>
+      this_term = terms_regexes[terms_regexes.length - depth];
+      for bite, i in bites
+        if typeof bite is 'string'
+          this_term.lastIndex = 0
+          while match = this_term.exec bite
+            new_bites = if i > 0 then bites.slice(0, i) else []
+            adjusted_index = match.index + match[1].length
+            if adjusted_index then new_bites.push bite.slice(0, adjusted_index)
+            new_bites.push [match[match.length - 1]]
+            if this_term.lastIndex < bite.length then new_bites.push bite.slice(this_term.lastIndex)
+            if i < bites.length - 1 then new_bites = new_bites.concat(bites.slice(i + 1))
+            if terms_regexes.length > depth
+              found_all_others = replace_inner new_bites, depth + 1
+              if found_all_others then return found_all_others
+              this_term.lastIndex = match.index + 1
+            else
+              escaped_bites = new_bites.map (v) => if typeof v is 'string' then this.escape_html(v) else '<em>' + this.escape_html(v[0]) + '</em>'
+              return escaped_bites.join ''
+      return false
 
-  search_string_match: (search_string, regex) ->
-    match = regex.exec(search_string)
-    match.index += 1 if !@search_contains && match?[1] # make up for lack of lookbehind operator in regex
-    match
+    found = replace_inner [text]
+    unless found
+      return text
+    unless @enable_split_word_search or found.substr(0,4) == '<em>'
+      return text
+    found
+
+  highlight_replace_in_order: (text, regex, terms) ->
+    match_index = -1
+    match_length = 0
+    replace_inner = () =>
+      match_index = arguments[arguments.length - 2]
+      match_length = arguments[0].length
+      unmatched = terms.slice(0);
+      retval = ''
+      for m, i in arguments
+        #Not elegant - any better way to skip first and last two?
+        if m and i > 0 and i < arguments.length - 2
+          m_cased = if @case_sensitive_search then m else m.toLowerCase()
+          j = unmatched.indexOf(m_cased);
+          if j >= 0
+            unmatched.splice(j, 1);
+            retval += '<em>' + this.escape_html(m) + '</em>'
+          else
+            retval += this.escape_html(m)
+      retval
+    
+    highlighted_html = text.replace regex, replace_inner
+    unless match_length
+      return text
+    else
+      prefix = text.slice(0, match_index)
+      suffix = text.slice(match_index + match_length)
+      fix    = if suffix.length > 0 then highlighted_html.slice(match_index, -(suffix.length)) else highlighted_html.slice(match_index)
+      "#{this.escape_html(prefix)}#{fix}#{this.escape_html(suffix)}"
 
   choices_count: ->
     return @selected_option_count if @selected_option_count?
